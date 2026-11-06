@@ -1,280 +1,180 @@
-import csv
-import logging
-import threading
-import queue
+
+import csv, threading, queue, os
 from datetime import datetime
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-
 import pandas as pd
 import pywhatkit
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill
+from openpyxl.utils import get_column_letter
 
-APP_TITLE = "WhatsApp Bulk Sender"
-BROWSER_WAIT_SECONDS = 20  # Browser-loading wait required by PyWhatKit; not an inter-message delay.
+WAIT_TIME = 30  # Allow WhatsApp Web extra time to load; not an inter-recipient delay.
 
-class WhatsAppBulkSender:
+class App:
     def __init__(self, root):
         self.root = root
-        self.root.title(APP_TITLE)
-        self.root.geometry("760x570")
-        self.root.minsize(680, 500)
-
-        self.file_path = tk.StringVar()
-        self.status_text = tk.StringVar(value="Choose an Excel workbook to begin.")
-        self.progress_text = tk.StringVar(value="0 / 0")
-        self.stop_event = threading.Event()
-        self.worker = None
+        root.title("WhatsApp Bulk Sender")
+        root.geometry("780x650")
+        root.minsize(680, 560)
+        self.excel = tk.StringVar()
+        self.image = tk.StringVar()
+        self.status = tk.StringVar(value="Select a contacts workbook.")
         self.events = queue.Queue()
-        self.log_path = None
+        self.stop_event = threading.Event()
+        self.build()
 
-        self._build_ui()
-        self.root.after(150, self._process_events)
+    def build(self):
+        f = ttk.Frame(self.root, padding=16); f.pack(fill="both", expand=True)
+        ttk.Label(f, text="WhatsApp Bulk Sender", font=("Segoe UI", 19, "bold")).pack(anchor="w")
+        ttk.Label(f, text="Contacts come from Excel. Compose one shared message and optionally choose one shared image here.", wraplength=720).pack(anchor="w", pady=(4,12))
 
-    def _build_ui(self):
-        outer = ttk.Frame(self.root, padding=18)
-        outer.pack(fill="both", expand=True)
+        ttk.Label(f, text="Contacts Excel (.xlsx)").pack(anchor="w")
+        r = ttk.Frame(f); r.pack(fill="x", pady=4)
+        ttk.Entry(r, textvariable=self.excel).pack(side="left", fill="x", expand=True)
+        ttk.Button(r, text="Browse", command=self.pick_excel).pack(side="left", padx=5)
+        ttk.Button(r, text="Create sample", command=self.sample).pack(side="left")
 
-        ttk.Label(outer, text=APP_TITLE, font=("Segoe UI", 18, "bold")).pack(anchor="w")
-        ttk.Label(
-            outer,
-            text="Reads Contacts and Messages sheets from an Excel workbook. "
-                 "Only contacts marked OptIn = Yes are eligible.",
-            wraplength=700
-        ).pack(anchor="w", pady=(5, 14))
+        ttk.Label(f, text="Message").pack(anchor="w", pady=(10,3))
+        self.msg = tk.Text(f, height=5, wrap="word")
+        self.msg.pack(fill="x")
+        self.msg.insert("1.0", "Hello {name}, this is a message for you.")
+        ttk.Label(f, text="Use {name} to personalize the message. Leave blank if sending an image only.", foreground="#555").pack(anchor="w", pady=(3,10))
 
-        file_row = ttk.Frame(outer)
-        file_row.pack(fill="x", pady=4)
-        ttk.Entry(file_row, textvariable=self.file_path).pack(side="left", fill="x", expand=True)
-        ttk.Button(file_row, text="Browse…", command=self._browse).pack(side="left", padx=(8, 0))
-        ttk.Button(file_row, text="Create sample Excel", command=self._create_template).pack(side="left", padx=(8, 0))
+        ttk.Label(f, text="Optional image (same image for all contacts)").pack(anchor="w")
+        r = ttk.Frame(f); r.pack(fill="x", pady=4)
+        ttk.Entry(r, textvariable=self.image).pack(side="left", fill="x", expand=True)
+        ttk.Button(r, text="Choose image", command=self.pick_image).pack(side="left", padx=5)
+        ttk.Button(r, text="Clear", command=lambda:self.image.set("")).pack(side="left")
 
-        ttk.Separator(outer).pack(fill="x", pady=14)
+        ttk.Separator(f).pack(fill="x", pady=12)
+        r = ttk.Frame(f); r.pack(fill="x")
+        self.progress = ttk.Progressbar(r, maximum=100); self.progress.pack(side="left", fill="x", expand=True)
+        self.progress_label = ttk.Label(r, text="0 / 0"); self.progress_label.pack(side="left", padx=10)
+        r = ttk.Frame(f); r.pack(fill="x", pady=8)
+        self.start_btn = ttk.Button(r, text="Start sending", command=self.start); self.start_btn.pack(side="left")
+        self.stop_btn = ttk.Button(r, text="Stop after current attempt", command=self.stop, state="disabled"); self.stop_btn.pack(side="left", padx=8)
+        ttk.Button(r, text="Open logs", command=self.open_logs).pack(side="right")
+        ttk.Label(f, textvariable=self.status, wraplength=720).pack(anchor="w", pady=5)
+        ttk.Label(f, text="Activity").pack(anchor="w")
+        self.log = tk.Text(f, height=12, state="disabled", wrap="word", font=("Consolas",9)); self.log.pack(fill="both", expand=True)
+        ttk.Label(f, text="Only send to people who explicitly opted in. ATTEMPTED means the browser automation call returned; it does not confirm delivery or reading. The WhatsApp tab is closed after each attempt to prevent tab buildup.", wraplength=720, foreground="#8a4b08").pack(anchor="w", pady=(8,0))
+        self.root.after(150, self.poll)
 
-        stats = ttk.Frame(outer)
-        stats.pack(fill="x")
-        ttk.Label(stats, text="Progress", font=("Segoe UI", 10, "bold")).pack(side="left")
-        ttk.Label(stats, textvariable=self.progress_text).pack(side="right")
+    def add_log(self, s):
+        self.log.configure(state="normal")
+        self.log.insert("end", f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {s}\\n")
+        self.log.see("end"); self.log.configure(state="disabled")
 
-        self.progress = ttk.Progressbar(outer, mode="determinate", maximum=100)
-        self.progress.pack(fill="x", pady=(6, 12))
+    def pick_excel(self):
+        p = filedialog.askopenfilename(filetypes=[("Excel workbook","*.xlsx")])
+        if p: self.excel.set(p)
 
-        controls = ttk.Frame(outer)
-        controls.pack(fill="x")
-        self.start_btn = ttk.Button(controls, text="Start sending", command=self._start)
-        self.start_btn.pack(side="left")
-        self.stop_btn = ttk.Button(controls, text="Stop after current attempt", command=self._stop, state="disabled")
-        self.stop_btn.pack(side="left", padx=8)
-        ttk.Button(controls, text="Open log folder", command=self._open_log_folder).pack(side="right")
+    def pick_image(self):
+        p = filedialog.askopenfilename(filetypes=[("Images","*.png *.jpg *.jpeg *.bmp *.gif"),("All files","*.*")])
+        if p: self.image.set(p)
 
-        ttk.Label(outer, textvariable=self.status_text, wraplength=700).pack(anchor="w", pady=(12, 8))
+    def sample(self):
+        p = filedialog.asksaveasfilename(defaultextension=".xlsx", initialfile="WhatsApp_Contacts.xlsx", filetypes=[("Excel workbook","*.xlsx")])
+        if not p: return
+        wb = Workbook(); ws = wb.active; ws.title = "Contacts"
+        ws.append(["Phone","Name","OptIn"]); ws.append(["+919876543210","Example Recipient","No"])
+        ws.freeze_panes = "A2"; ws.auto_filter.ref = ws.dimensions
+        for c in ws[1]:
+            c.font = Font(bold=True,color="FFFFFF"); c.fill = PatternFill("solid",fgColor="217346")
+        for col in ws.columns:
+            ws.column_dimensions[get_column_letter(col[0].column)].width = max(16,max(len(str(c.value or "")) for c in col)+3)
+        wb.save(p); self.excel.set(p)
+        messagebox.showinfo("Sample created","Add opted-in recipients to Contacts. Set OptIn to Yes only when they agreed to receive WhatsApp messages.")
 
-        ttk.Label(outer, text="Activity", font=("Segoe UI", 10, "bold")).pack(anchor="w")
-        self.activity = tk.Text(outer, height=15, wrap="word", state="disabled", font=("Consolas", 9))
-        self.activity.pack(fill="both", expand=True, pady=(5, 0))
+    @staticmethod
+    def phone(v):
+        s = str(v).strip()
+        if s.endswith(".0"): s = s[:-2]
+        s = s.replace(" ","").replace("-","").replace("(","").replace(")","")
+        if not s.startswith("+"): s = "+" + s
+        if not s[1:].isdigit(): raise ValueError("Use international format, e.g. +919876543210")
+        return s
 
-        note = (
-            "Important: Use only for recipients who explicitly opted in. "
-            "Follow WhatsApp policies and honor opt-outs. PyWhatKit automates a browser; "
-            "a logged 'SUBMITTED' result is not proof of delivery or reading. "
-            "Keep WhatsApp Web logged in. Do not use this to send unsolicited bulk messages."
-        )
-        ttk.Label(outer, text=note, wraplength=700, foreground="#8a4b08").pack(anchor="w", pady=(10, 0))
-
-    def _browse(self):
-        selected = filedialog.askopenfilename(
-            title="Select WhatsApp Excel workbook",
-            filetypes=[("Excel workbook", "*.xlsx")]
-        )
-        if selected:
-            self.file_path.set(selected)
-
-    def _create_template(self):
-        path = filedialog.asksaveasfilename(
-            title="Save sample workbook",
-            defaultextension=".xlsx",
-            initialfile="WhatsApp_Bulk_Messages.xlsx",
-            filetypes=[("Excel workbook", "*.xlsx")]
-        )
-        if not path:
-            return
-        from openpyxl import Workbook
-        wb = Workbook()
-        contacts = wb.active
-        contacts.title = "Contacts"
-        contacts.append(["Phone", "Name", "OptIn"])
-        contacts.append(["+919876543210", "Example Recipient", "No"])
-        messages = wb.create_sheet("Messages")
-        messages.append(["Message"])
-        messages.append(["Hello {name}, this is an example message."])
-        wb.save(path)
-        self.file_path.set(path)
-        self._append_activity(f"Created workbook: {path}")
-        messagebox.showinfo(
-            "Workbook created",
-            "Template created. Replace the example contact and set OptIn to Yes only "
-            "for people who agreed to receive WhatsApp messages."
-        )
-
-    def _append_activity(self, text):
-        self.activity.configure(state="normal")
-        self.activity.insert("end", f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {text}\n")
-        self.activity.see("end")
-        self.activity.configure(state="disabled")
-
-    def _start(self):
-        path = self.file_path.get().strip()
-        if not path or not Path(path).is_file():
-            messagebox.showerror("Excel file required", "Choose a valid .xlsx workbook first.")
-            return
+    def start(self):
+        x = self.excel.get().strip(); msg = self.msg.get("1.0","end").strip(); img = self.image.get().strip()
+        if not x or not Path(x).is_file():
+            messagebox.showerror("Excel required","Select a valid contacts workbook."); return
+        if not msg and not img:
+            messagebox.showerror("Content required","Enter a message, choose an image, or both."); return
+        if img and not Path(img).is_file():
+            messagebox.showerror("Image missing","Choose an existing image."); return
         try:
-            contacts = pd.read_excel(path, sheet_name="Contacts")
-            messages = pd.read_excel(path, sheet_name="Messages")
-            required = {"Phone", "Name", "OptIn"}
-            if not required.issubset(set(contacts.columns)):
-                raise ValueError("Contacts sheet must contain columns: Phone, Name, OptIn.")
-            if "Message" not in messages.columns or messages.empty:
-                raise ValueError("Messages sheet must contain a non-empty Message column.")
-            eligible = contacts[
-                contacts["Phone"].notna()
-                & contacts["OptIn"].astype(str).str.strip().str.lower().isin(["yes", "true", "1"])
-            ]
-            if eligible.empty:
-                raise ValueError("No eligible contacts. Add recipients who opted in and set OptIn to Yes.")
-            message = str(messages.iloc[0]["Message"]).strip()
-            if not message or message.lower() == "nan":
-                raise ValueError("The Message cell is empty.")
-        except Exception as exc:
-            messagebox.showerror("Workbook validation failed", str(exc))
+            df = pd.read_excel(x, sheet_name="Contacts", dtype={"Phone":str})
+            if not {"Phone","Name","OptIn"}.issubset(df.columns):
+                raise ValueError("Contacts sheet needs Phone, Name and OptIn columns.")
+            df = df[df.Phone.notna() & df.OptIn.astype(str).str.strip().str.lower().isin(["yes","true","1"])]
+            if df.empty: raise ValueError("No opted-in contacts found (OptIn must be Yes).")
+        except Exception as e:
+            messagebox.showerror("Workbook error",str(e)); return
+        kind = "image + caption" if img and msg else ("image only" if img else "text")
+        if not messagebox.askyesno("Confirm",f"{len(df)} opted-in contacts.\\nContent: {kind}\\n\\nSame message/image will be used for everyone. Continue only if recipients opted in. Start?"):
             return
+        self.stop_event.clear(); self.start_btn.configure(state="disabled"); self.stop_btn.configure(state="normal")
+        self.progress.configure(maximum=len(df),value=0); self.progress_label.configure(text=f"0 / {len(df)}")
+        self.status.set("Sending started. Keep WhatsApp Web logged in.")
+        threading.Thread(target=self.worker,args=(x,msg,img),daemon=True).start()
 
-        if not messagebox.askyesno(
-            "Confirm campaign",
-            f"{len(eligible)} opted-in contacts are eligible.\n\n"
-            "PyWhatKit will use WhatsApp Web in your browser. "
-            "Continue only if these recipients agreed to receive this message.\n\nStart?"
-        ):
-            return
-
-        self.stop_event.clear()
-        self.start_btn.configure(state="disabled")
-        self.stop_btn.configure(state="normal")
-        self.progress.configure(value=0, maximum=len(eligible))
-        self.progress_text.set(f"0 / {len(eligible)}")
-        self.status_text.set("Starting… Keep the browser session available.")
-        self.worker = threading.Thread(
-            target=self._send_worker,
-            args=(path,),
-            daemon=True
-        )
-        self.worker.start()
-
-    def _send_worker(self, path):
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_dir = Path(path).resolve().parent / "logs"
-        log_dir.mkdir(exist_ok=True)
-        self.log_path = log_dir / f"whatsapp_log_{timestamp}.csv"
-
+    def worker(self,x,msg,img):
         try:
-            contacts = pd.read_excel(path, sheet_name="Contacts")
-            messages = pd.read_excel(path, sheet_name="Messages")
-            message_template = str(messages.iloc[0]["Message"]).strip()
-
-            eligible = contacts[
-                contacts["Phone"].notna()
-                & contacts["OptIn"].astype(str).str.strip().str.lower().isin(["yes", "true", "1"])
-            ]
-
-            total = len(eligible)
-            processed = 0
-            with open(self.log_path, "w", newline="", encoding="utf-8-sig") as csvfile:
-                writer = csv.writer(csvfile)
-                writer.writerow(["Timestamp", "Phone", "Name", "Status", "Details"])
-
-                for _, row in eligible.iterrows():
-                    if self.stop_event.is_set():
-                        break
-
-                    phone = str(row["Phone"]).strip()
-                    # Avoid Excel converting phone numbers to floats/scientific notation.
-                    if phone.endswith(".0"):
-                        phone = phone[:-2]
-                    name = "" if pd.isna(row["Name"]) else str(row["Name"]).strip()
-                    personalized_message = message_template.replace("{name}", name or "there")
-                    stamp = datetime.now().astimezone().isoformat(timespec="seconds")
-
+            df = pd.read_excel(x,sheet_name="Contacts",dtype={"Phone":str})
+            df = df[df.Phone.notna() & df.OptIn.astype(str).str.strip().str.lower().isin(["yes","true","1"])]
+            folder = Path(x).resolve().parent / "logs"; folder.mkdir(exist_ok=True)
+            logpath = folder / f"whatsapp_log_{datetime.now():%Y%m%d_%H%M%S}.csv"
+            done=0; total=len(df)
+            with open(logpath,"w",newline="",encoding="utf-8-sig") as fp:
+                w=csv.writer(fp); w.writerow(["Timestamp","Phone","Name","Type","Status","Details"])
+                for _,row in df.iterrows():
+                    if self.stop_event.is_set(): break
+                    name = "" if pd.isna(row.Name) else str(row.Name).strip()
                     try:
-                        if not phone.startswith("+") or not phone[1:].isdigit():
-                            raise ValueError("Phone must include country code, e.g. +919876543210")
+                        phone=self.phone(row.Phone); body=msg.replace("{name}",name or "there")
+                        if img:
+                            args={"receiver":phone,"img_path":img,"wait_time":WAIT_TIME,"tab_close":True}
+                            if body: args["caption"]=body
+                            pywhatkit.sendwhats_image(**args); typ="Image + caption" if body else "Image"
+                        else:
+                            pywhatkit.sendwhatmsg_instantly(phone,body,wait_time=WAIT_TIME,tab_close=True); typ="Text"
+                        status="ATTEMPTED"; details="PyWhatKit returned. Verify the message appears as a sent bubble; composer text alone is not success."
+                    except Exception as e:
+                        phone=str(row.Phone); typ="Image" if img else "Text"; status="FAILED"; details=str(e).replace("\\n"," ")[:1000]
+                    w.writerow([datetime.now().astimezone().isoformat(timespec="seconds"),phone,name,typ,status,details]); fp.flush()
+                    done+=1; self.events.put(("progress",done,total,phone,status))
+            self.events.put(("done",str(logpath),done,total,self.stop_event.is_set()))
+        except Exception as e: self.events.put(("error",str(e)))
 
-                        pywhatkit.sendwhatmsg_instantly(
-                            phone,
-                            personalized_message,
-                            wait_time=BROWSER_WAIT_SECONDS,
-                            tab_close=True
-                        )
-                        status = "SUBMITTED"
-                        details = "PyWhatKit call returned; delivery is not confirmed."
-                    except Exception as exc:
-                        status = "FAILED"
-                        details = str(exc).replace("\n", " ")[:1000]
+    def stop(self):
+        self.stop_event.set(); self.stop_btn.configure(state="disabled")
+        self.status.set("Stop requested; current browser attempt will finish first.")
 
-                    writer.writerow([stamp, phone, name, status, details])
-                    csvfile.flush()
-                    processed += 1
-                    self.events.put(("progress", processed, total, phone, status))
-
-            final = "Stopped by user." if self.stop_event.is_set() else "Processing completed."
-            self.events.put(("finished", final, str(self.log_path), processed, total))
-        except Exception as exc:
-            self.events.put(("fatal", str(exc)))
-
-    def _stop(self):
-        self.stop_event.set()
-        self.status_text.set("Stop requested. The current browser attempt will finish first.")
-        self.stop_btn.configure(state="disabled")
-
-    def _process_events(self):
+    def poll(self):
         try:
             while True:
-                event = self.events.get_nowait()
-                if event[0] == "progress":
-                    _, done, total, phone, status = event
-                    self.progress.configure(value=done)
-                    self.progress_text.set(f"{done} / {total}")
-                    self.status_text.set(f"{status}: {phone}")
-                    self._append_activity(f"{status}: {phone}")
-                elif event[0] == "finished":
-                    _, final, log_path, processed, total = event
-                    self.start_btn.configure(state="normal")
-                    self.stop_btn.configure(state="disabled")
-                    self.status_text.set(f"{final} {processed}/{total} processed. Log: {log_path}")
-                    self._append_activity(final)
-                    messagebox.showinfo("Finished", f"{final}\nProcessed: {processed}/{total}\n\nLog:\n{log_path}")
-                elif event[0] == "fatal":
-                    self.start_btn.configure(state="normal")
-                    self.stop_btn.configure(state="disabled")
-                    self.status_text.set("Application error.")
-                    self._append_activity(f"ERROR: {event[1]}")
-                    messagebox.showerror("Application error", event[1])
-        except queue.Empty:
-            pass
-        self.root.after(150, self._process_events)
+                e=self.events.get_nowait()
+                if e[0]=="progress":
+                    _,d,t,p,s=e; self.progress.configure(value=d); self.progress_label.configure(text=f"{d} / {t}")
+                    self.status.set(f"{s}: {p}"); self.add_log(f"{s}: {p}")
+                elif e[0]=="done":
+                    _,logpath,d,t,stopped=e; self.start_btn.configure(state="normal"); self.stop_btn.configure(state="disabled")
+                    text=("Stopped" if stopped else "Completed")+f": {d}/{t}. Log: {logpath}"
+                    self.status.set(text); self.add_log(text); messagebox.showinfo("Finished",text)
+                elif e[0]=="error":
+                    self.start_btn.configure(state="normal"); self.stop_btn.configure(state="disabled")
+                    self.status.set("Application error"); messagebox.showerror("Error",e[1])
+        except queue.Empty: pass
+        self.root.after(150,self.poll)
 
-    def _open_log_folder(self):
-        import os
-        import sys
-        folder = Path(self.file_path.get()).resolve().parent / "logs" if self.file_path.get() else Path.cwd() / "logs"
+    def open_logs(self):
+        folder=Path(self.excel.get()).resolve().parent/"logs" if self.excel.get() else Path.cwd()/"logs"
         folder.mkdir(exist_ok=True)
-        try:
-            if sys.platform.startswith("win"):
-                os.startfile(folder)
-            else:
-                messagebox.showinfo("Log folder", str(folder))
-        except Exception as exc:
-            messagebox.showerror("Cannot open folder", str(exc))
+        try: os.startfile(folder)
+        except Exception as e: messagebox.showerror("Cannot open logs",str(e))
 
-if __name__ == "__main__":
-    root = tk.Tk()
-    app = WhatsAppBulkSender(root)
-    root.mainloop()
+if __name__=="__main__":
+    root=tk.Tk(); App(root); root.mainloop()
